@@ -1,0 +1,352 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: foobar
+imagePullSecrets:
+- name: armadamultiarch
+secrets:
+  - name: armadamultiarch
+---
+apiVersion: v1
+data:
+  .dockerconfigjson: eyJhdXRocyI6eyJ1cy5pY3IuaW8iOnsidXNlcm5hbWUiOiJ0b2tlbiIsInBhc3N3b3JkIjoiZXlKaGJHY2lPaUpJVXpJMU5pSXNJblI1Y0NJNklrcFhWQ0o5LmV5SnFkR2tpT2lKa09UQTRPV1F4WWkwMU16QXhMVFZqTXpFdFlXRXhaQzFqTXpkbE9HUm1NamhsWW1VaUxDSnBjM01pT2lKeVpXZHBjM1J5ZVM1dVp5NWliSFZsYldsNExtNWxkQ0o5LkU0Q2FUVW9vTUQ0cHNDMmZ4N01peGFMZnZjMjFyTFlUY3d2UExGcndYak0iLCJhdXRoIjoiZEc5clpXNDZaWGxLYUdKSFkybFBhVXBKVlhwSk1VNXBTWE5KYmxJMVkwTkpOa2xyY0ZoV1EwbzVMbVY1U25Ga1IydHBUMmxLYTA5VVFUUlBWMUY0V1drd01VMTZRWGhNVkZacVRYcEZkRmxYUlhoYVF6RnFUWHBrYkU5SFVtMU5hbWhzV1cxVmFVeERTbkJqTTAxcFQybEtlVnBYWkhCak0xSjVaVk0xZFZwNU5XbGlTRlpzWWxkc05FeHROV3hrUTBvNUxrVTBRMkZVVlc5dlRVUTBjSE5ETW1aNE4wMXBlR0ZNWm5aak1qRnlURmxVWTNkMlVFeEdjbmRZYWswPSJ9fX0=
+kind: Secret
+metadata:
+  name: armadamultiarch
+type: kubernetes.io/dockerconfigjson
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: invoke-sbs
+spec:
+  params:
+    - name: endpoint
+      description: service name of SBS container
+      default: "https://zbcsor10.hursley.ibm.com:23443/image"
+    - name: certificate
+      description: PEM file containing public/private keypair
+  workspaces:
+  - name: task-pvc
+    mountPath: /artifacts
+  steps:
+    - name: build-docker-image
+      env:
+        - name: ENDPOINT
+          value: $(params.endpoint)
+        - name: CERTIFICATE
+          value: $(params.certificate)
+      image: us.icr.io/armadamultiarch/davehaybase:latest
+      securityContext:
+        runAsUser: 0
+        privileged: true
+      command:
+        - sh
+        - -c
+        - set -e -o pipefail;
+          export username=token &&
+          export password=$(cat $HOME/.docker/config.json | jq --raw-output '.auths."us.icr.io".password') &&
+          echo $password | docker login --username=$username --password-stdin $REGISTRY &&
+          docker build -f $PATH_TO_DOCKER_FILE -t $REGISTRY/$NAMESPACE/$IMAGE:$TAG . &&
+          docker push $REGISTRY/$NAMESPACE/$IMAGE:$TAG &&
+          echo \"Done\"
+      volumeMounts:
+        - name: docker-socket
+          mountPath: /var/run/docker.sock
+  volumes:
+    - name: docker-socket
+      hostPath:
+        path: /var/run/docker.sock
+        type: Socket
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: deploy-task
+spec:
+  params:
+    - name: repository
+      description: the git repo
+    - name: revision
+      description: the revision
+      default: master
+    - name: deployment-file
+      default: deployment.yaml
+    - name: registry
+      description: the IBM Cloud Container Registry service
+      default: us.icr.io
+    - name: namespace
+      description: the IBM Cloud Container Registry namespace
+      default: armadamultiarch
+    - name: image
+      description: to-be-built image name
+      default: "hello-world-nginx"
+    - name: tag
+      description: to-be-built image tag
+      default: "latest"
+    - name: api
+      description: the ibmcloud api endpoint
+      default: "https://test.cloud.ibm.com"
+    - name: apikey
+      description: IBM Cloud API Key
+    - name: region
+      description: IBM Cloud API Region
+    - name: cluster-name
+      description: Name of IKS K8s cluster
+      default: "cluster1"
+    - name: secret
+      description: K8s secret for target IBM Cloud Container Registry namespace
+      default: "armadamultiarch"
+  workspaces:
+  - name: task-pvc
+    mountPath: /artifacts
+  steps:
+    - name: clone-repo
+      image: us.icr.io/armadamultiarch/davehaybase:latest
+      env:
+        - name: REPOSITORY
+          value: $(params.repository)
+        - name: REVISION
+          value: $(params.revision)
+      command: ["/bin/sh", "-c"]
+      args:
+        - set -e -o pipefail;
+          echo "Cloning $REPOSITORY";
+          git clone -q -b $REVISION $REPOSITORY .;
+    - name: deploy-to-kubernetes
+      image: us.icr.io/armadamultiarch/davehaybase:latest
+      env:
+        - name: REGISTRY
+          value: $(params.registry)
+        - name: NAMESPACE
+          value: $(params.namespace)
+        - name: IMAGE
+          value: $(params.image)
+        - name: TAG
+          value: $(params.tag)
+        - name: DEPLOYMENT_FILE
+          value: $(params.deployment-file)
+        - name: SECRET
+          value: $(params.secret)
+      command: ["/bin/sh", "-c"]
+      args:
+        - sed -i'' -e "s;__IMAGE__;$IMAGE;g" "$DEPLOYMENT_FILE";
+          sed -i'' -e "s;__REGISTRY__;$REGISTRY;g" "$DEPLOYMENT_FILE";
+          sed -i'' -e "s;__NAMESPACE__;$NAMESPACE;g" "$DEPLOYMENT_FILE";
+          sed -i'' -e "s;__TAG__;$TAG;g" "$DEPLOYMENT_FILE";
+          sed -i'' -e "s;__SECRET__;$SECRET;g" "$DEPLOYMENT_FILE";
+          cp $DEPLOYMENT_FILE /artifacts;
+    - name: deploy-pod-to-k8s
+      image: us.icr.io/armadamultiarch/davehaybase:latest
+      env:
+        - name: API
+          value: $(params.api)
+        - name: IBMCLOUD_API_KEY
+          value: $(params.apikey)
+        - name: REGION
+          value: $(params.region)
+        - name: CLUSTER
+          value: $(params.cluster-name)
+        - name: DEPLOYMENT_FILE
+          value: $(params.deployment-file)
+      command: ["/bin/sh","-c"]
+      args:
+        - ibmcloud login --apikey $IBMCLOUD_API_KEY -a $API -r $REGION;
+          ibmcloud plugin install /tmp/container-service-linux-s390x;
+          ibmcloud ks init --host https://origin.containers.dev.cloud.ibm.com;
+          ibmcloud ks cluster config --cluster $CLUSTER --admin --network;
+          kubectl apply -f /artifacts/$DEPLOYMENT_FILE;
+          kubectl get pods;
+          kubectl get nodes;
+          kubectl get services;
+---
+apiVersion: tekton.dev/v1beta1
+kind: Pipeline
+metadata:
+  name: pipeline
+spec:
+  params:
+    - name: repository
+      description: the git repo
+    - name: revision
+      description: the branch for the git repo
+    - name: registry
+      description: the IBM Cloud Container Registry service
+    - name: namespace
+      description: the IBM Cloud Container Registry namespace
+    - name: image
+      description: to-be-built image name
+    - name: tag
+      description: to-be-built image tag
+    - name: apikey
+      description: IBM Cloud API Key
+    - name: region
+      description: IBM Cloud API Region
+    - name: cluster-name
+      description: Name of IKS K8s cluster
+    - name: secret
+      description: K8s secret for target IBM Cloud Container Registry namespace
+  workspaces:
+  - name: pipeline-pvc
+  tasks:
+    - name: pipeline-build-task
+      taskRef:
+        name: build-task
+      params:
+        - name: repository
+          value: $(params.repository)
+        - name: revision
+          value: $(params.revision)
+        - name: registry
+          value: $(params.registry)
+        - name: namespace
+          value: $(params.namespace)
+        - name: image
+          value: $(params.image)
+        - name: tag
+          value: $(params.tag)
+      workspaces:
+      - name: task-pvc
+        workspace: pipeline-pvc
+    - name: pipeline-deploy-task
+      taskRef:
+        name: deploy-task
+      params:
+        - name: repository
+          value: $(params.repository)
+        - name: revision
+          value: $(params.revision)
+        - name: apikey
+          value: $(params.apikey)
+        - name: region
+          value: $(params.region)
+        - name: cluster-name
+          value: $(params.cluster-name)
+        - name: image
+          value: $(params.image)
+        - name: tag
+          value: $(params.tag)
+        - name: secret
+          value: $(params.secret)
+      workspaces:
+      - name: task-pvc
+        workspace: pipeline-pvc
+---
+apiVersion: tekton.dev/v1beta1
+kind: TriggerTemplate
+metadata:
+  name: template
+spec:
+  params:
+    - name: repository
+      description: The git repo
+    - name: revision
+      description: the branch for the git repo
+    - name: registry
+      description: the IBM Cloud Container Registry service
+    - name: namespace
+      description: the IBM Cloud Container Registry namespace
+    - name: image
+      description: to-be-built image name
+      default: "hello-world-nginx"
+    - name: tag
+      description: to-be-built image tag
+      default: "latest"
+    - name: apikey
+      description: IBM Cloud API Key
+    - name: region
+      description: IBM Cloud API Key
+      default: "us-south"
+    - name: cluster-name
+      description: Name of IKS K8s cluster
+      default: "cluster1"
+    - name: secret
+      default: "armadamultiarch"
+  resourcetemplates:
+    - apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata:
+        name: pipelinerun-$(uid)-pvc
+      spec:
+        resources:
+          requests:
+            storage:  5Gi
+        volumeMode: Filesystem
+        accessModes:
+          - ReadWriteOnce
+    - apiVersion: tekton.dev/v1beta1
+      kind: PipelineRun
+      metadata:
+        name: pipelinerun-$(uid)
+      spec:
+        serviceAccountName: foobar
+        pipelineRef:
+            name: pipeline
+        workspaces:
+          - name: pipeline-pvc
+            persistentVolumeClaim:
+              claimName: pipelinerun-$(uid)-pvc
+        params:
+        - name: repository
+          value: $(params.repository)
+        - name: revision
+          value: $(params.revision)
+        - name: registry
+          value: $(params.registry)
+        - name: namespace
+          value: $(params.namespace)
+        - name: image
+          value: $(params.image)
+        - name: tag
+          value: $(params.tag)
+        - name: apikey
+          value: $(params.apikey)
+        - name: region
+          value: $(params.region)
+        - name: cluster-name
+          value: $(params.cluster-name)
+        - name: secret
+          value: $(params.secret)
+---
+apiVersion: tekton.dev/v1beta1
+kind: TriggerBinding
+metadata:
+  name: binding
+spec:
+  params:
+    - name: repository
+      value: "https://github.com/davidhay1969/HelloWorldNginx.git"
+    - name: revision
+      value: "master"
+    - name: path-to-docker-file
+      value: Dockerfile
+    - name: registry
+      value: "us.icr.io"
+    - name: namespace
+      value: "armadamultiarch"
+    - name: image
+      value: "hello-world-nginx"
+    - name: tag
+      value: "latest"
+    - name: deployment-file
+      value: "deployment.yaml"
+    - name: api
+      value: "https://test.cloud.ibm.com"
+    - name: apikey
+    - name: region
+      value: "us-south"
+    - name: cluster-name
+      value: "cluster1"
+    - name: secret
+      value: "armadamultiarch"
+---
+apiVersion: tekton.dev/v1beta1
+kind: EventListener
+metadata:
+  name: listener
+spec:
+  triggers:
+    - binding:
+        name: binding
+      template:
+        name: template
